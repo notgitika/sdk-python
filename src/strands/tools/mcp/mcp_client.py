@@ -329,7 +329,7 @@ class MCPClient:
         result = MCPToolResult(
             status=status,
             toolUseId=tool_use_id,
-            content=mapped_content,
+            content=mapped_content,  # type: ignore[typeddict-item]
         )
         if call_tool_result.structuredContent:
             result["structuredContent"] = call_tool_result.structuredContent

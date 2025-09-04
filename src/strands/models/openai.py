@@ -33,6 +33,12 @@ class Client(Protocol):
         """Chat completions interface."""
         ...
 
+    @property
+    # pragma: no cover
+    def responses(self) -> Any:
+        """Responses interface."""
+        ...
+
 
 class OpenAIModel(Model):
     """OpenAI model provider implementation."""
