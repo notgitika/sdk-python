@@ -22,7 +22,39 @@ T = TypeVar("T", bound=BaseModel)
 
 
 class OpenAIResponsesModel(OpenAIModel):
-    """OpenAI Responses API model provider implementation."""
+    """OpenAI Responses API model provider implementation with native tools support."""
+
+    # Define supported native tools (just the type names)
+    NATIVE_TOOLS = {
+        "web_search",
+        "file_search",
+        "image_generation",
+        "code_interpreter",
+        "computer_use",
+        # Add more as OpenAI releases them
+    }
+
+    def __init__(self, config: dict[str, Any], **kwargs: Any):
+        """Initialize with optional native tools configuration."""
+        # Extract native tools configuration before calling parent
+        self.native_tools_config = config.get("native_tools", [])
+
+        # Separate client args from model config
+        client_args_keys = {"api_key", "base_url", "timeout", "max_retries", "default_headers", "http_client"}
+        client_args = {k: v for k, v in config.items() if k in client_args_keys}
+
+        # Filter out client args and non-OpenAI config keys from model config
+        model_config_keys = config.keys() - client_args_keys - {"native_tools"}
+        model_config = {k: config[k] for k in model_config_keys}
+
+        # Call parent with separated client_args and model config
+        super().__init__(client_args=client_args if client_args else None, **model_config, **kwargs)
+
+        # Validate native tools
+        for tool_config in self.native_tools_config:
+            tool_type = tool_config.get("type")
+            if tool_type not in self.NATIVE_TOOLS:
+                logger.warning("Unknown native tool type: %s", tool_type)
 
     @classmethod
     def format_request_message_content(cls, content: ContentBlock, message_role: str = "user") -> dict[str, Any]:
@@ -153,10 +185,35 @@ class OpenAIResponsesModel(OpenAIModel):
 
         return result
 
+    def _build_tools_array(self, tool_specs: Optional[list[ToolSpec]] = None) -> list[dict[str, Any]]:
+        """Build tools array combining native tools and custom functions."""
+        tools = []
+
+        # Add native tools first
+        for tool_config in self.native_tools_config:
+            tool_type = tool_config.get("type")
+            if tool_type in self.NATIVE_TOOLS:
+                # Native tools use simple format: { "type": "web_search" }
+                tools.append({"type": tool_type})
+
+        # Add custom function tools
+        if tool_specs:
+            for tool_spec in tool_specs:
+                tools.append(
+                    {
+                        "type": "function",
+                        "name": tool_spec["name"],
+                        "description": tool_spec["description"],
+                        "parameters": tool_spec["inputSchema"]["json"],
+                    }
+                )
+
+        return tools
+
     def format_request(
         self, messages: Messages, tool_specs: Optional[list[ToolSpec]] = None, system_prompt: Optional[str] = None
     ) -> dict[str, Any]:
-        """Format a Responses API compatible request."""
+        """Format a Responses API compatible request with native tools support."""
         message_data = self.format_request_messages(messages, system_prompt)
 
         request = {
@@ -174,19 +231,9 @@ class OpenAIResponsesModel(OpenAIModel):
         supported_params = self._filter_params_for_responses_api(include_max_tokens=True)
         request.update(supported_params)
 
-        # Always include tools (empty list if none provided)
-        if tool_specs:
-            request["tools"] = [
-                {
-                    "type": "function",
-                    "name": tool_spec["name"],
-                    "description": tool_spec["description"],
-                    "parameters": tool_spec["inputSchema"]["json"],
-                }
-                for tool_spec in tool_specs
-            ]
-        else:
-            request["tools"] = []
+        # Build tools array with both native and custom tools
+        tools = self._build_tools_array(tool_specs)
+        request["tools"] = tools
 
         return request
 
@@ -198,30 +245,39 @@ class OpenAIResponsesModel(OpenAIModel):
         system_prompt: Optional[str] = None,
         **kwargs: Any,
     ) -> AsyncGenerator[StreamEvent, None]:
-        """Stream conversation with the OpenAI Responses API model."""
+        """Stream conversation with the OpenAI Responses API model with native tools support."""
         request = self.format_request(messages, tool_specs, system_prompt)
         response = await self.client.responses.create(**request)
 
         yield self.format_chunk({"chunk_type": "message_start"})
-        yield self.format_chunk({"chunk_type": "content_start", "data_type": "text"})
 
+        # Track state for proper event handling
+        current_content_type = None
         tool_calls: dict[str, dict[str, Any]] = {}
         final_usage = None
-        has_text_content = False
 
         async for event in response:
-            if hasattr(event, "type"):
-                if event.type == "response.output_text.delta":
-                    # Text content streaming
-                    if hasattr(event, "delta") and isinstance(event.delta, str):
-                        has_text_content = True
-                        yield self.format_chunk(
-                            {"chunk_type": "content_delta", "data_type": "text", "data": event.delta}
-                        )
+            if not hasattr(event, "type"):
+                continue
 
-                elif event.type == "response.output_item.added":
-                    # Tool call started
-                    if hasattr(event, "item") and hasattr(event.item, "type") and event.item.type == "function_call":
+            # Handle text content
+            if event.type == "response.output_text.delta":
+                if current_content_type != "text":
+                    yield self.format_chunk({"chunk_type": "content_start", "data_type": "text"})
+                    current_content_type = "text"
+
+                if hasattr(event, "delta") and isinstance(event.delta, str):
+                    yield self.format_chunk({"chunk_type": "content_delta", "data_type": "text", "data": event.delta})
+
+            # Handle function calls (custom tools only - native tools are handled automatically by OpenAI)
+            elif event.type == "response.output_item.added":
+                if hasattr(event, "item") and hasattr(event.item, "type"):
+                    if event.item.type == "function_call":
+                        # Only handle custom function calls
+                        # Native tools are executed automatically by OpenAI
+                        if current_content_type == "text":
+                            yield self.format_chunk({"chunk_type": "content_stop"})
+
                         call_id = getattr(event.item, "call_id", "unknown")
                         tool_calls[call_id] = {
                             "name": getattr(event.item, "name", ""),
@@ -230,44 +286,60 @@ class OpenAIResponsesModel(OpenAIModel):
                             "item_id": getattr(event.item, "id", ""),
                         }
 
-                elif event.type == "response.function_call_arguments.delta":
-                    # Tool arguments streaming - match by item_id
-                    if hasattr(event, "delta") and hasattr(event, "item_id"):
-                        for _call_id, call_info in tool_calls.items():
-                            if call_info["item_id"] == event.item_id:
-                                call_info["arguments"] += event.delta
-                                break
+                        mock_tool_call = type(
+                            "MockToolCall",
+                            (),
+                            {
+                                "function": type(
+                                    "MockFunction", (), {"name": tool_calls[call_id]["name"], "arguments": ""}
+                                )(),
+                                "id": call_id,
+                            },
+                        )()
 
-                elif event.type == "response.completed":
-                    # Response complete
-                    if hasattr(event, "response") and hasattr(event.response, "usage"):
-                        final_usage = event.response.usage
-                    break
+                        yield self.format_chunk(
+                            {"chunk_type": "content_start", "data_type": "tool", "data": mock_tool_call}
+                        )
+                        current_content_type = "tool"
 
-        # Close text content if we had any
-        if has_text_content:
-            yield self.format_chunk({"chunk_type": "content_stop", "data_type": "text"})
+            elif event.type == "response.function_call_arguments.delta":
+                # Handle function arguments for custom tools
+                if hasattr(event, "delta") and hasattr(event, "item_id"):
+                    for call_info in tool_calls.values():
+                        if call_info["item_id"] == event.item_id:
+                            call_info["arguments"] += event.delta
 
-        # Yield tool calls if any
-        for call_info in tool_calls.values():
-            mock_tool_call = type(
-                "MockToolCall",
-                (),
-                {
-                    "function": type(
-                        "MockFunction", (), {"name": call_info["name"], "arguments": call_info["arguments"]}
-                    )(),
-                    "id": call_info["call_id"],
-                },
-            )()
+                            mock_tool_call = type(
+                                "MockToolCall",
+                                (),
+                                {
+                                    "function": type(
+                                        "MockFunction",
+                                        (),
+                                        {"name": call_info["name"], "arguments": call_info["arguments"]},
+                                    )(),
+                                    "id": call_info["call_id"],
+                                },
+                            )()
 
-            yield self.format_chunk({"chunk_type": "content_start", "data_type": "tool", "data": mock_tool_call})
-            yield self.format_chunk({"chunk_type": "content_delta", "data_type": "tool", "data": mock_tool_call})
-            yield self.format_chunk({"chunk_type": "content_stop", "data_type": "tool"})
+                            yield self.format_chunk(
+                                {"chunk_type": "content_delta", "data_type": "tool", "data": mock_tool_call}
+                            )
 
-        finish_reason = "tool_calls" if tool_calls else "stop"
+            elif event.type == "response.completed":
+                # Close any open content
+                if current_content_type:
+                    yield self.format_chunk({"chunk_type": "content_stop"})
+
+                if hasattr(event, "response") and hasattr(event.response, "usage"):
+                    final_usage = event.response.usage
+                break
+
+        # Determine finish reason
+        finish_reason = "tool_use" if tool_calls else "end_turn"
         yield self.format_chunk({"chunk_type": "message_stop", "data": finish_reason})
 
+        # Add usage information if available
         if final_usage:
             usage_data = type(
                 "Usage",
@@ -284,11 +356,15 @@ class OpenAIResponsesModel(OpenAIModel):
     async def structured_output(
         self, output_model: Type[T], prompt: Messages, system_prompt: Optional[str] = None, **kwargs: Any
     ) -> AsyncGenerator[dict[str, Union[T, Any]], None]:
-        """Get structured output from the model using Responses API."""
+        """Get structured output from the model using Responses API with native tools support."""
+        # Format the basic request
         request = self.format_request_messages(prompt, system_prompt)
 
-        supported_params = self._filter_params_for_responses_api(include_max_tokens=False)
+        # Add structured output format (note the different API shape for Responses API)
+        request["text"] = {"format": output_model}
 
+        # Add model and parameters
+        supported_params = self._filter_params_for_responses_api(include_max_tokens=False)
         request.update(
             {
                 "model": self.config["model_id"],
@@ -296,7 +372,13 @@ class OpenAIResponsesModel(OpenAIModel):
             }
         )
 
-        parsed_response = await self.client.responses.parse(text_format=output_model, **request)
+        # Add tools (including native tools) for structured output
+        tools = self._build_tools_array()
+        if tools:
+            request["tools"] = tools
+
+        # Use responses.parse for structured output
+        parsed_response = await self.client.responses.parse(**request)
 
         parsed = parsed_response.output_parsed
         if not parsed:
